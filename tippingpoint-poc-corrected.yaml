@@ -1,0 +1,1014 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: TippingPoint PoC - Full stack with auth, CloudFront, and all bug fixes
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: tippingpoint-poc
+
+Resources:
+
+  # ── FRONTEND ─────────────────────────────────────────────────────────────────
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: login.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+
+  # FIX: CloudFront distribution added — app is served via CloudFront,
+  #      not directly from S3 website endpoint.
+  FrontendCloudFront:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: FrontendBucket
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3WebsiteOrigin
+            DomainName: !Sub '${FrontendBucket}.s3-website-${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: S3WebsiteOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          # TTL=0 ensures fresh content during PoC development
+          DefaultTTL: 0
+          MinTTL: 0
+          MaxTTL: 31536000
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /login.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /login.html
+
+  # ── STORAGE ──────────────────────────────────────────────────────────────────
+
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: doc_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: doc_id
+          KeyType: HASH
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: token
+          AttributeType: S
+      KeySchema:
+        - AttributeName: token
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  # ── IAM ──────────────────────────────────────────────────────────────────────
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PocAppAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt DocumentsTable.Arn
+                  - !GetAtt UsersTable.Arn
+                  - !Sub '${UsersTable.Arn}/index/*'
+                  - !GetAtt SessionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${DocumentsBucket.Arn}/*'
+
+  # ── LAMBDA ───────────────────────────────────────────────────────────────────
+
+  ApiLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DocumentsTable
+          BUCKET_NAME: !Ref DocumentsBucket
+          USERS_TABLE: !Ref UsersTable
+          SESSIONS_TABLE: !Ref SessionsTable
+      Code:
+        ZipFile: |
+          import json, boto3, os, uuid, base64, hashlib, secrets, time
+          from datetime import datetime, timezone
+
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          TABLE_NAME = os.environ['TABLE_NAME']
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+          USERS_TABLE = os.environ.get('USERS_TABLE', '')
+          SESSIONS_TABLE = os.environ.get('SESSIONS_TABLE', '')
+          docs_table = dynamodb.Table(TABLE_NAME)
+
+          CORS = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+            'Access-Control-Allow-Methods': 'GET,POST,DELETE,PUT,OPTIONS',
+            'Content-Type': 'application/json'
+          }
+
+          def resp(code, body):
+            return {'statusCode': code, 'headers': CORS, 'body': json.dumps(body, default=str)}
+
+          def hash_pw(pw):
+            return hashlib.sha256(pw.encode()).hexdigest()
+
+          def get_user_from_token(token):
+            if not token or not SESSIONS_TABLE: return None
+            try:
+              t = dynamodb.Table(SESSIONS_TABLE)
+              s = t.get_item(Key={'token': token}).get('Item')
+              if not s: return None
+              if s.get('expires_at', 0) < time.time(): return None
+              u = dynamodb.Table(USERS_TABLE)
+              return u.get_item(Key={'user_id': s['user_id']}).get('Item')
+            except: return None
+
+          def require_auth(event, require_admin=False):
+            auth = event.get('headers', {}).get('Authorization', '')
+            token = auth.replace('Bearer ', '') if auth else ''
+            user = get_user_from_token(token)
+            if not user: return None, resp(401, {'error': 'Unauthorized'})
+            if require_admin and user.get('role') != 'admin': return None, resp(403, {'error': 'Admin required'})
+            return user, None
+
+          def handler(event, context):
+            method = event.get('httpMethod', 'GET')
+            path = event.get('path', '/')
+            if method == 'OPTIONS': return resp(200, {})
+            try:
+              # ── AUTH ROUTES ──────────────────────────────────────────────────
+              if path == '/auth/login' and method == 'POST':
+                body = json.loads(event.get('body', '{}'))
+                email = body.get('email', '').lower().strip()
+                pw = body.get('password', '')
+                if not email or not pw: return resp(400, {'error': 'Email and password required'})
+                u = dynamodb.Table(USERS_TABLE)
+                res = u.query(IndexName='email-index', KeyConditionExpression='email = :e',
+                  ExpressionAttributeValues={':e': email})
+                items = res.get('Items', [])
+                if not items or items[0].get('password_hash') != hash_pw(pw):
+                  return resp(401, {'error': 'Invalid email or password'})
+                user = items[0]
+                if user.get('status') == 'disabled': return resp(403, {'error': 'Account disabled'})
+                token = secrets.token_urlsafe(32)
+                s = dynamodb.Table(SESSIONS_TABLE)
+                s.put_item(Item={'token': token, 'user_id': user['user_id'],
+                  'expires_at': int(time.time()) + 86400 * 7})
+                return resp(200, {'token': token, 'user': {
+                  'user_id': user['user_id'], 'email': user['email'],
+                  'name': user.get('name', ''), 'role': user.get('role', 'user'),
+                  'must_change': user.get('must_change', False)
+                }})
+
+              if path == '/auth/me' and method == 'GET':
+                user, err = require_auth(event)
+                if err: return err
+                return resp(200, {'user': {
+                  'user_id': user['user_id'], 'email': user['email'],
+                  'name': user.get('name', ''), 'role': user.get('role', 'user'),
+                  'must_change': user.get('must_change', False)
+                }})
+
+              if path == '/auth/logout' and method == 'POST':
+                auth = event.get('headers', {}).get('Authorization', '')
+                token = auth.replace('Bearer ', '')
+                if token:
+                  try: dynamodb.Table(SESSIONS_TABLE).delete_item(Key={'token': token})
+                  except: pass
+                return resp(200, {'message': 'Logged out'})
+
+              if path == '/auth/change-password' and method == 'POST':
+                user, err = require_auth(event)
+                if err: return err
+                body = json.loads(event.get('body', '{}'))
+                old_pw = body.get('oldPassword', '')
+                new_pw = body.get('newPassword', '')
+                if user.get('password_hash') != hash_pw(old_pw):
+                  return resp(400, {'error': 'Current password incorrect'})
+                if len(new_pw) < 8: return resp(400, {'error': 'Password must be at least 8 characters'})
+                u = dynamodb.Table(USERS_TABLE)
+                u.update_item(Key={'user_id': user['user_id']},
+                  UpdateExpression='SET password_hash = :h, must_change = :f',
+                  ExpressionAttributeValues={':h': hash_pw(new_pw), ':f': False})
+                return resp(200, {'message': 'Password changed'})
+
+              # ── USER MGMT (admin only) ───────────────────────────────────────
+              if path == '/users' and method == 'GET':
+                user, err = require_auth(event, require_admin=True)
+                if err: return err
+                u = dynamodb.Table(USERS_TABLE)
+                items = u.scan(ProjectionExpression='user_id, email, #n, #r, #s, created_at',
+                  ExpressionAttributeNames={'#n': 'name', '#r': 'role', '#s': 'status'}).get('Items', [])
+                items.sort(key=lambda x: x.get('created_at', ''))
+                return resp(200, {'users': items})
+
+              if path == '/users' and method == 'POST':
+                user, err = require_auth(event, require_admin=True)
+                if err: return err
+                body = json.loads(event.get('body', '{}'))
+                email = body.get('email', '').lower().strip()
+                name = body.get('name', '')
+                role = body.get('role', 'user')
+                temp_pw = body.get('password', secrets.token_urlsafe(10))
+                if not email: return resp(400, {'error': 'Email required'})
+                u = dynamodb.Table(USERS_TABLE)
+                existing = u.query(IndexName='email-index',
+                  KeyConditionExpression='email = :e', ExpressionAttributeValues={':e': email})
+                if existing.get('Items'): return resp(409, {'error': 'Email already exists'})
+                uid = str(uuid.uuid4())
+                u.put_item(Item={
+                  'user_id': uid, 'email': email, 'name': name,
+                  'role': role, 'status': 'active', 'must_change': True,
+                  'password_hash': hash_pw(temp_pw),
+                  'created_at': datetime.now(timezone.utc).isoformat()
+                })
+                return resp(201, {'user_id': uid, 'email': email, 'temp_password': temp_pw})
+
+              if path.startswith('/users/') and method == 'PUT':
+                user, err = require_auth(event, require_admin=True)
+                if err: return err
+                uid = path.split('/')[2]
+                body = json.loads(event.get('body', '{}'))
+                u = dynamodb.Table(USERS_TABLE)
+                updates = []
+                vals = {}
+                names = {}
+                if 'role' in body:
+                  updates.append('#r = :r'); vals[':r'] = body['role']; names['#r'] = 'role'
+                if 'status' in body:
+                  updates.append('#s = :s'); vals[':s'] = body['status']; names['#s'] = 'status'
+                if 'name' in body:
+                  updates.append('#n = :n'); vals[':n'] = body['name']; names['#n'] = 'name'
+                if 'password' in body:
+                  updates.append('password_hash = :h, must_change = :mc')
+                  vals[':h'] = hash_pw(body['password']); vals[':mc'] = True
+                if updates:
+                  # FIX: Conditionally include ExpressionAttributeNames
+                  #      to avoid passing None which raises a DynamoDB error.
+                  update_kwargs = {
+                    'Key': {'user_id': uid},
+                    'UpdateExpression': 'SET ' + ', '.join(updates),
+                    'ExpressionAttributeValues': vals
+                  }
+                  if names:
+                    update_kwargs['ExpressionAttributeNames'] = names
+                  u.update_item(**update_kwargs)
+                return resp(200, {'message': 'Updated'})
+
+              if path.startswith('/users/') and method == 'DELETE':
+                user, err = require_auth(event, require_admin=True)
+                if err: return err
+                uid = path.split('/')[2]
+                if uid == user['user_id']: return resp(400, {'error': 'Cannot delete yourself'})
+                dynamodb.Table(USERS_TABLE).delete_item(Key={'user_id': uid})
+                return resp(200, {'message': 'Deleted'})
+
+              # ── DOCS ROUTES ──────────────────────────────────────────────────
+              if path == '/docs' and method == 'GET':
+                user, err = require_auth(event)
+                if err: return err
+                items = docs_table.scan().get('Items', [])
+                items.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+                return resp(200, {'documents': items})
+
+              if path == '/docs' and method == 'POST':
+                user, err = require_auth(event)
+                if err: return err
+                body = json.loads(event.get('body', '{}'))
+                fd = body.get('formData', {})
+                doc_id = str(uuid.uuid4())
+                now = datetime.now(timezone.utc).isoformat()
+                status = body.get('status', 'Active')
+                item = {
+                  'doc_id': doc_id, 'customer_name': fd.get('customerName', 'Unknown'),
+                  'se_name': fd.get('seName', ''), 'account_manager': fd.get('accountManager', ''),
+                  'industry': fd.get('customerIndustry', ''), 'poc_start': fd.get('pocStart', ''),
+                  'poc_end': fd.get('pocEnd', ''), 'created_at': now, 'status': status,
+                  'created_by': user.get('email', ''),
+                  's3_key': f'pdfs/{doc_id}.pdf',
+                  'form_data': fd
+                }
+                docs_table.put_item(Item=item)
+                pdf = body.get('pdfBase64', '')
+                if pdf and status != 'Draft':
+                  s3.put_object(Bucket=BUCKET_NAME, Key=f'pdfs/{doc_id}.pdf',
+                    Body=base64.b64decode(pdf), ContentType='application/pdf')
+                return resp(201, {'doc_id': doc_id})
+
+              if method == 'PUT' and path.startswith('/docs/') and len(path.split('/')) == 3:
+                user, err = require_auth(event)
+                if err: return err
+                doc_id = path.split('/')[2]
+                body = json.loads(event.get('body', '{}'))
+                fd = body.get('formData', {})
+                status = body.get('status', 'Active')
+                now = datetime.now(timezone.utc).isoformat()
+                update_expr = 'SET updated_at = :ua, #st = :st'
+                expr_vals = {':ua': now, ':st': status}
+                expr_names = {'#st': 'status'}
+                if fd:
+                  update_expr += ', customer_name = :cn, se_name = :sn, account_manager = :am, industry = :ind, poc_start = :ps, poc_end = :pe, form_data = :fd'
+                  expr_vals.update({
+                    ':cn': fd.get('customerName', ''), ':sn': fd.get('seName', ''),
+                    ':am': fd.get('accountManager', ''), ':ind': fd.get('customerIndustry', ''),
+                    ':ps': fd.get('pocStart', ''), ':pe': fd.get('pocEnd', ''), ':fd': fd
+                  })
+                docs_table.update_item(
+                  Key={'doc_id': doc_id},
+                  UpdateExpression=update_expr,
+                  ExpressionAttributeValues=expr_vals,
+                  ExpressionAttributeNames=expr_names
+                )
+                pdf = body.get('pdfBase64', '')
+                if pdf and status != 'Draft':
+                  item = docs_table.get_item(Key={'doc_id': doc_id}).get('Item', {})
+                  s3.put_object(Bucket=BUCKET_NAME, Key=item.get('s3_key', f'pdfs/{doc_id}.pdf'),
+                    Body=base64.b64decode(pdf), ContentType='application/pdf')
+                return resp(200, {'doc_id': doc_id})
+
+              if method == 'GET' and '/download' in path:
+                user, err = require_auth(event)
+                if err: return err
+                doc_id = path.split('/')[2]
+                item = docs_table.get_item(Key={'doc_id': doc_id}).get('Item')
+                if not item: return resp(404, {'error': 'Not found'})
+                url = s3.generate_presigned_url('get_object',
+                  Params={'Bucket': BUCKET_NAME, 'Key': item.get('s3_key', f'pdfs/{doc_id}.pdf')},
+                  ExpiresIn=300)
+                return resp(200, {'download_url': url})
+
+              if method == 'DELETE' and len(path.split('/')) >= 3 and path.startswith('/docs'):
+                user, err = require_auth(event)
+                if err: return err
+                doc_id = path.split('/')[2]
+                item = docs_table.get_item(Key={'doc_id': doc_id}).get('Item')
+                if item:
+                  try: s3.delete_object(Bucket=BUCKET_NAME, Key=item.get('s3_key', f'pdfs/{doc_id}.pdf'))
+                  except: pass
+                  docs_table.delete_item(Key={'doc_id': doc_id})
+                return resp(200, {'message': 'Deleted'})
+
+              return resp(404, {'error': 'Not found'})
+            except Exception as e:
+              print(f'Error: {e}')
+              return resp(500, {'error': str(e)})
+
+  # ── API GATEWAY ──────────────────────────────────────────────────────────────
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  # /docs
+  DocsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: docs
+
+  # /docs/{id}
+  DocIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DocsResource
+      PathPart: '{id}'
+
+  # /docs/{id}/download
+  DownloadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DocIdResource
+      PathPart: download
+
+  # /auth
+  AuthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: auth
+
+  # /auth/login
+  AuthLoginResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref AuthResource
+      PathPart: login
+
+  # /auth/me
+  AuthMeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref AuthResource
+      PathPart: me
+
+  # /auth/logout
+  AuthLogoutResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref AuthResource
+      PathPart: logout
+
+  # /auth/change-password
+  AuthChangePwResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref AuthResource
+      PathPart: change-password
+
+  # /users
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: users
+
+  # /users/{id}
+  UserIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref UsersResource
+      PathPart: '{id}'
+
+  # ── METHODS: /docs ────────────────────────────────────────────────────────────
+
+  GetDocsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DocsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  PostDocsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DocsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  OptionsDocsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DocsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ── METHODS: /docs/{id} ───────────────────────────────────────────────────────
+
+  # FIX: PutDocMethod was missing — Lambda handles PUT /docs/{id} but there
+  #      was no corresponding API Gateway method defined.
+  PutDocMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DocIdResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  DeleteDocMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DocIdResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  # FIX: OptionsDocIdMethod was missing PUT — now reflects all real methods.
+  OptionsDocIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DocIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ── METHODS: /docs/{id}/download ─────────────────────────────────────────────
+
+  GetDownloadMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DownloadResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  OptionsDownloadMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DownloadResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ── METHODS: /auth/* ──────────────────────────────────────────────────────────
+
+  PostLoginMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthLoginResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  OptionsLoginMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthLoginResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  GetMeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthMeResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  OptionsMeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthMeResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  PostLogoutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthLogoutResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  OptionsLogoutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthLogoutResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  PostChangePwMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthChangePwResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  OptionsChangePwMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthChangePwResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ── METHODS: /users & /users/{id} ────────────────────────────────────────────
+
+  GetUsersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  PostUsersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  OptionsUsersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  PutUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UserIdResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  DeleteUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UserIdResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations'
+
+  OptionsUserIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UserIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ── DEPLOYMENT ────────────────────────────────────────────────────────────────
+
+  # FIX: DependsOn was incomplete — missing logout, change-password, user PUT/DELETE,
+  #      and all OPTIONS methods. An incomplete DependsOn can cause a race condition
+  #      where the deployment is created before some methods are registered,
+  #      resulting in 404s for those routes after stack creation.
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      # /docs
+      - GetDocsMethod
+      - PostDocsMethod
+      - OptionsDocsMethod
+      # /docs/{id}
+      - PutDocMethod
+      - DeleteDocMethod
+      - OptionsDocIdMethod
+      # /docs/{id}/download
+      - GetDownloadMethod
+      - OptionsDownloadMethod
+      # /auth/*
+      - PostLoginMethod
+      - OptionsLoginMethod
+      - GetMeMethod
+      - OptionsMeMethod
+      - PostLogoutMethod
+      - OptionsLogoutMethod
+      - PostChangePwMethod
+      - OptionsChangePwMethod
+      # /users
+      - GetUsersMethod
+      - PostUsersMethod
+      - OptionsUsersMethod
+      # /users/{id}
+      - PutUserMethod
+      - DeleteUserMethod
+      - OptionsUserIdMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: prod
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${RestApi}/*'
+
+# ── OUTPUTS ───────────────────────────────────────────────────────────────────
+
+Outputs:
+  FrontendBucketName:
+    Description: S3 bucket name for frontend assets
+    Value: !Ref FrontendBucket
+
+  FrontendS3URL:
+    Description: Direct S3 website URL (use CloudFrontURL for production)
+    Value: !Sub 'http://${FrontendBucket}.s3-website-${AWS::Region}.amazonaws.com'
+
+  CloudFrontURL:
+    Description: CloudFront URL — use this as the primary app URL
+    Value: !Sub 'https://${FrontendCloudFront.DomainName}'
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (needed to invalidate cache after deploys)
+    Value: !Ref FrontendCloudFront
+
+  ApiEndpoint:
+    Description: API Gateway base URL
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+
+  LambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref ApiLambda
+
+  UsersTableName:
+    Description: DynamoDB users table name
+    Value: !Ref UsersTable
+
+  DocumentsTableName:
+    Description: DynamoDB documents table name
+    Value: !Ref DocumentsTable
